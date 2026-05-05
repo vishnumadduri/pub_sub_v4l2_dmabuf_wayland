@@ -7,14 +7,15 @@
 namespace dmabuf {
 
 struct V4l2Buffer {
-    int dmabuf_fd = -1; // exported via VIDIOC_EXPBUF
+    int dmabuf_fd = -1;    // exported via VIDIOC_EXPBUF
     uint32_t index = 0;
     uint32_t length = 0;
+    uint32_t bytesused = 0; // filled by dequeue(); bytes written by the driver this frame
 };
 
 // Thin RAII wrapper around a V4L2 capture device configured for MMAP buffers
-// that are exported as DMA-BUF file descriptors. Single-plane formats only
-// (we focus on YUYV first).
+// that are exported as DMA-BUF file descriptors. Single-plane YUV formats
+// (YUYV, NV12) are the primary targets; the fd is passed zero-copy to EGL.
 class V4l2Capture {
 public:
     V4l2Capture() = default;

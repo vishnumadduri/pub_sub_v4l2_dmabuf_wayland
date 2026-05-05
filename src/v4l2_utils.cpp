@@ -142,8 +142,7 @@ void V4l2Capture::stop() {
         streaming_ = false;
     }
     for (auto& b : buffers_) {
-        if (b.dmabuf_fd >= 0) ::close(b.dmabuf_fd);
-        b.dmabuf_fd = -1;
+        if (b.dmabuf_fd >= 0) { ::close(b.dmabuf_fd); b.dmabuf_fd = -1; }
     }
     buffers_.clear();
 
@@ -184,6 +183,7 @@ bool V4l2Capture::dequeue(uint32_t& index) {
         return false;
     }
     index = buf.index;
+    buffers_[buf.index].bytesused = buf.bytesused;
     return true;
 }
 

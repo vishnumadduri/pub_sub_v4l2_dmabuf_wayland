@@ -54,6 +54,7 @@ private:
     PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES_ = nullptr;
 
     bool has_dma_buf_import_ = false;
+    bool has_modifiers_ = false;
 };
 
 // Tiny GL renderer that draws a fullscreen textured quad, sampling either an
@@ -67,9 +68,9 @@ public:
     QuadRenderer(const QuadRenderer&) = delete;
     QuadRenderer& operator=(const QuadRenderer&) = delete;
 
-    // drm_fourcc selects YUYV vs RGB shader path and texture target.
-    // YUYV uses GL_TEXTURE_EXTERNAL_OES so the driver does YUV→RGB in
-    // hardware; RGB uses GL_TEXTURE_2D with a plain pass-through shader.
+    // drm_fourcc selects YUV vs RGB shader path and texture target.
+    // YUV formats (YUYV, NV12, NV21) use GL_TEXTURE_EXTERNAL_OES so the driver
+    // does YUV→RGB in hardware; RGB uses GL_TEXTURE_2D with a pass-through shader.
     bool init(uint32_t drm_fourcc);
     void destroy();
 
@@ -88,8 +89,8 @@ private:
     GLint attr_uv_ = -1;
     GLint uniform_tex_ = -1;
     GLint uniform_tex_size_ = -1; // unused for YUYV/external path
-    bool yuyv_ = false;
-    GLenum tex_target_ = GL_TEXTURE_2D; // GL_TEXTURE_EXTERNAL_OES for YUYV
+    bool yuv_ = false;
+    GLenum tex_target_ = GL_TEXTURE_2D; // GL_TEXTURE_EXTERNAL_OES for YUV formats
     int viewport_w_ = 0;
     int viewport_h_ = 0;
 };

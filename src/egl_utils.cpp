@@ -17,10 +17,19 @@ EglContext::~EglContext() {
 }
 
 bool EglContext::init(wl_display* wl_display, wl_egl_window* egl_window) {
-    // Bind the EGL platform to Wayland. We use the platform display so the
-    // driver knows we're going to feed it a wl_display, not a native X11
-    // Display.
-    display_ = eglGetDisplay(reinterpret_cast<EGLNativeDisplayType>(wl_display));
+    // Use the platform display API so Mesa picks the right EGL backend when
+    // multiple GPUs or display outputs are present.
+    const char* client_exts = eglQueryString(EGL_NO_DISPLAY, EGL_EXTENSIONS);
+    if (client_exts &&
+        (std::strstr(client_exts, "EGL_EXT_platform_wayland") ||
+         std::strstr(client_exts, "EGL_KHR_platform_wayland"))) {
+        auto fn = reinterpret_cast<PFNEGLGETPLATFORMDISPLAYEXTPROC>(
+            eglGetProcAddress("eglGetPlatformDisplayEXT"));
+        if (fn)
+            display_ = fn(EGL_PLATFORM_WAYLAND_EXT, wl_display, nullptr);
+    }
+    if (display_ == EGL_NO_DISPLAY)
+        display_ = eglGetDisplay(reinterpret_cast<EGLNativeDisplayType>(wl_display));
     if (display_ == EGL_NO_DISPLAY) {
         std::fprintf(stderr, "eglGetDisplay failed\n");
         return false;
@@ -87,6 +96,7 @@ bool EglContext::init(wl_display* wl_display, wl_egl_window* egl_window) {
     if (!has_dma_buf_import_) {
         std::fprintf(stderr, "warning: EGL_EXT_image_dma_buf_import not advertised\n");
     }
+    has_modifiers_ = std::strstr(exts, "EGL_EXT_image_dma_buf_import_modifiers") != nullptr;
 
     eglCreateImageKHR_ = reinterpret_cast<PFNEGLCREATEIMAGEKHRPROC>(
         eglGetProcAddress("eglCreateImageKHR"));
@@ -117,9 +127,9 @@ void EglContext::destroy() {
 }
 
 EGLImageKHR EglContext::import_dmabuf(int dmabuf_fd, const FrameMeta& meta) {
-    // Build the attribute list the driver expects for a DMA-BUF import. For
-    // single-plane formats (YUYV, RGB) only PLANE0_* attrs are needed. NV12
-    // would also need PLANE1_FD/OFFSET/PITCH and a second offset.
+    // Mesa (all platforms, kernels ≥ 5.10) requires explicit DRM format
+    // modifiers when the extension is advertised. DRM_FORMAT_MOD_LINEAR (= 0)
+    // tells the driver this is a plain linear buffer — what V4L2 MMAP gives us.
     std::vector<EGLint> attrs = {
         EGL_WIDTH,                     static_cast<EGLint>(meta.width),
         EGL_HEIGHT,                    static_cast<EGLint>(meta.height),
@@ -128,6 +138,30 @@ EGLImageKHR EglContext::import_dmabuf(int dmabuf_fd, const FrameMeta& meta) {
         EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
         EGL_DMA_BUF_PLANE0_PITCH_EXT,  static_cast<EGLint>(meta.stride),
     };
+    if (has_modifiers_) {
+        attrs.insert(attrs.end(), {
+            EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, 0,
+            EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, 0,
+        });
+    }
+
+    // NV12/NV21 is semi-planar: Y at offset 0, interleaved UV at stride*height.
+    // Both planes live in the same DMA-BUF fd and share the luma stride.
+    if (meta.format == DRM_FORMAT_NV12 || meta.format == DRM_FORMAT_NV21) {
+        EGLint uv_offset = static_cast<EGLint>(meta.stride * meta.height);
+        attrs.insert(attrs.end(), {
+            EGL_DMA_BUF_PLANE1_FD_EXT,     dmabuf_fd,
+            EGL_DMA_BUF_PLANE1_OFFSET_EXT, uv_offset,
+            EGL_DMA_BUF_PLANE1_PITCH_EXT,  static_cast<EGLint>(meta.stride),
+        });
+        if (has_modifiers_) {
+            attrs.insert(attrs.end(), {
+                EGL_DMA_BUF_PLANE1_MODIFIER_LO_EXT, 0,
+                EGL_DMA_BUF_PLANE1_MODIFIER_HI_EXT, 0,
+            });
+        }
+    }
+
     attrs.push_back(EGL_NONE);
 
     EGLImageKHR img = eglCreateImageKHR_(
@@ -235,12 +269,14 @@ QuadRenderer::~QuadRenderer() {
 }
 
 bool QuadRenderer::init(uint32_t drm_fourcc) {
-    yuyv_ = (drm_fourcc == DRM_FORMAT_YUYV);
-    // YUYV gets GL_TEXTURE_EXTERNAL_OES so the hardware handles YUV→RGB.
-    // All other formats use a plain GL_TEXTURE_2D with an RGB pass-through.
-    tex_target_ = yuyv_ ? GL_TEXTURE_EXTERNAL_OES : GL_TEXTURE_2D;
+    // YUV formats (YUYV, NV12, NV21) use GL_TEXTURE_EXTERNAL_OES so the GPU
+    // driver handles YUV→RGB at sample time. RGB formats use GL_TEXTURE_2D.
+    yuv_ = (drm_fourcc == DRM_FORMAT_YUYV ||
+             drm_fourcc == DRM_FORMAT_NV12  ||
+             drm_fourcc == DRM_FORMAT_NV21);
+    tex_target_ = yuv_ ? GL_TEXTURE_EXTERNAL_OES : GL_TEXTURE_2D;
 
-    program_ = link_program(kVertexShader, yuyv_ ? kFragmentShaderYUYV : kFragmentShaderRGB);
+    program_ = link_program(kVertexShader, yuv_ ? kFragmentShaderYUYV : kFragmentShaderRGB);
     if (!program_) return false;
 
     attr_pos_    = glGetAttribLocation(program_, "a_pos");
