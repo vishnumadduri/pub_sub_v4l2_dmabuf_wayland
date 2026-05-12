@@ -1,11 +1,13 @@
-// Subscriber: opens a Wayland xdg-toplevel window, sets up EGL/GLES2 on it,
-// then loops:
-//   recvmsg(SCM_RIGHTS) → EGLImageKHR(LINUX_DMA_BUF_EXT) →
-//   glEGLImageTargetTexture2DOES → draw quad → eglSwapBuffers →
-//   eglDestroyImage → close(fd) → send 1-byte ack
+// Subscriber: opens a Wayland xdg-toplevel window and renders DMA-BUF frames.
 //
-// The ack closes the loop with the publisher so it knows the buffer is
-// safe to re-queue.
+// Handshake (once):
+//   recv_handshake → Handshake struct + N OwnedFds (held for the session)
+//
+// Per frame:
+//   recv(u32 idx) → import fds[idx] → draw → eglDestroyImage → send 1-byte ack
+//
+// eglDestroyImageKHR must precede send_ack so EGL releases its DMA-BUF
+// reference before the publisher calls QBUF.
 
 mod wayland;
 mod egl;
@@ -14,8 +16,8 @@ use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use common::socket::{connect_to_socket, recv_frame, send_ack, RecvFrame};
-use common::{DEFAULT_SOCKET_PATH};
+use common::socket::{connect_to_socket, recv_handshake, recv_idx, send_ack, RecvIdx};
+use common::{FrameMeta, DEFAULT_SOCKET_PATH};
 use egl::{EglContext, EGL_NO_IMAGE_KHR, QuadRenderer};
 use wayland::WaylandWindow;
 
@@ -48,60 +50,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sock = connect_to_socket(&socket_path)?;
     let sock_raw = sock.as_raw_fd();
 
-    // Peek the first frame to learn the image dimensions before creating
-    // the window (we size the window to match the capture resolution).
-    let (first_meta, first_fd) = match recv_frame(sock_raw) {
-        RecvFrame::Frame(m, fd) => (m, fd),
-        RecvFrame::PeerClosed   => return Err("publisher closed before first frame".into()),
-        RecvFrame::Err(e)       => return Err(e.into()),
-    };
-
+    // Receive geometry and all DMA-BUF fds in one message.
+    let (hs, buf_fds) = recv_handshake(sock_raw)?;
     println!(
-        "subscriber: first frame {}x{} format=0x{:x} stride={}",
-        first_meta.width, first_meta.height, first_meta.format, first_meta.stride
+        "subscriber: {}x{} format=0x{:x} stride={} bufs={}",
+        hs.width, hs.height, hs.format, hs.stride, hs.buf_count
     );
 
-    let mut win = WaylandWindow::create(first_meta.width, first_meta.height, "dmabuf subscriber")?;
+    // FrameMeta is constant for the session; reconstructed from the handshake.
+    let frame_meta = FrameMeta {
+        width:  hs.width,
+        height: hs.height,
+        format: hs.format,
+        stride: hs.stride,
+        size:   hs.size,
+    };
+
+    let mut win = WaylandWindow::create(hs.width, hs.height, "dmabuf subscriber")?;
     let egl = EglContext::init(win.display_ptr(), win.egl_window_ptr())?;
-    let mut renderer = QuadRenderer::init(first_meta.format)?;
-    renderer.set_viewport(first_meta.width as i32, first_meta.height as i32);
+    let mut renderer = QuadRenderer::init(hs.format)?;
+    renderer.set_viewport(hs.width as i32, hs.height as i32);
 
     let image_target = egl.gl_image_target;
 
-    // Draw a frame and send the ack back to the publisher.
-    let draw_one = |meta: &common::FrameMeta, fd: i32| -> bool {
-        let img = egl.import_dmabuf(fd, meta);
+    // Import buffer[idx], draw, destroy the EGLImage, then ack.
+    // buf_fds are kept open for the session; no per-frame close needed.
+    let draw_one = |idx: u32| -> bool {
+        let fd = buf_fds[idx as usize].as_raw_fd();
+        let img = egl.import_dmabuf(fd, &frame_meta);
         if img == EGL_NO_IMAGE_KHR {
             return false;
         }
         renderer.draw(img, image_target);
         egl.swap_buffers();
         egl.destroy_image(img);
-        // EGL took its own reference at import time; our fd copy is no longer needed.
-        // The OwnedFd caller will close it.
         send_ack(sock_raw).is_ok()
     };
 
-    // Draw the first frame.
-    {
-        let fd_raw = first_fd.as_raw_fd();
-        if !draw_one(&first_meta, fd_raw) {
-            return Ok(());
-        }
-    }
-    win.dispatch_pending();
-
-    let mut last_log       = Instant::now();
-    let mut frames_since_log: u32 = 1;
+    let mut last_log         = Instant::now();
+    let mut frames_since_log: u32 = 0;
 
     while RUNNING.load(Ordering::Relaxed) && !win.should_close() {
-        let (meta, owned_fd) = match recv_frame(sock_raw) {
-            RecvFrame::Frame(m, fd) => (m, fd),
-            RecvFrame::PeerClosed   => { println!("subscriber: peer closed"); break; }
-            RecvFrame::Err(e)       => { eprintln!("recv_frame: {e}"); break; }
+        let idx = match recv_idx(sock_raw) {
+            RecvIdx::Idx(i)  => i,
+            RecvIdx::PeerClosed => { println!("subscriber: peer closed"); break; }
+            RecvIdx::Err(e)     => { eprintln!("recv_idx: {e}"); break; }
         };
 
-        if !draw_one(&meta, owned_fd.as_raw_fd()) {
+        if !draw_one(idx) {
             break;
         }
 

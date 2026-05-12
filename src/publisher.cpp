@@ -1,12 +1,11 @@
-// Publisher: captures frames from /dev/video0 via V4L2 (MMAP), exports each
-// buffer as a DMA-BUF, and forwards the file descriptor to a single
+// Publisher: captures frames from a V4L2 device and streams them to a
 // subscriber over a Unix domain socket.
 //
-// Flow per frame:
-//   DQBUF -> sendmsg(SCM_RIGHTS, fd) -> wait for 1-byte ack -> QBUF
+// Handshake (once):
+//   sendmsg(SCM_RIGHTS, all N dmabuf fds) + HandshakeMsg
 //
-// The ack handshake is what keeps the producer/consumer synchronised: we
-// only re-queue a buffer once the subscriber is done sampling from it.
+// Per frame:
+//   DQBUF → send(u32 idx) → wait 1-byte ack → QBUF
 
 #include <atomic>
 #include <chrono>
@@ -14,98 +13,94 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 #include <unistd.h>
 #include <linux/videodev2.h>
 
 #include "socket_utils.hpp"
 #include "v4l2_utils.hpp"
 
-using dmabuf::FrameMeta;
+using dmabuf::HandshakeMsg;
 using dmabuf::ScopedFd;
 using dmabuf::V4l2Capture;
 
 namespace {
 
 std::atomic<bool> g_running{true};
+void on_sigint(int) { g_running.store(false); }
 
-void on_sigint(int) {
-    g_running.store(false);
-}
-
-// Block until the subscriber has sent a single ACK byte back. This forms
-// our flow control: we never re-queue a buffer that the GPU might still
-// be sampling on the other side.
 bool wait_for_ack(int sock_fd) {
     char ack = 0;
     ssize_t n = ::recv(sock_fd, &ack, 1, 0);
-    if (n <= 0) {
-        if (n == 0) std::fprintf(stderr, "subscriber disconnected\n");
-        else        std::perror("recv ack");
-        return false;
-    }
+    if (n == 0) { std::fprintf(stderr, "wait_for_ack: subscriber disconnected\n"); return false; }
+    if (n < 0)  { std::perror("wait_for_ack"); return false; }
     return true;
 }
 
 } // namespace
 
 int main(int argc, char** argv) {
-    // Default capture parameters; override via CLI as needed. Start with YUYV
-    // because every USB UVC webcam supports it natively.
-    std::string device = "/dev/video0";
-    uint32_t width = 640;
-    uint32_t height = 480;
-    uint32_t v4l2_format = V4L2_PIX_FMT_YUYV;
-    std::string socket_path = dmabuf::kDefaultSocketPath;
+    std::string device    = "/dev/video0";
+    uint32_t    width     = 640;
+    uint32_t    height    = 480;
+    uint32_t    v4l2_fmt  = V4L2_PIX_FMT_YUYV;
+    std::string sock_path = dmabuf::kDefaultSocketPath;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
-        auto next = [&](const std::string& flag) {
-            if (i + 1 >= argc) {
-                std::fprintf(stderr, "missing value for %s\n", flag.c_str());
-                std::exit(2);
-            }
-            return std::string(argv[++i]);
-        };
-        if (a == "--device")        device = next(a);
-        else if (a == "--width")    width = std::stoi(next(a));
-        else if (a == "--height")   height = std::stoi(next(a));
-        else if (a == "--socket")   socket_path = next(a);
-        else if (a == "--nv12")     v4l2_format = V4L2_PIX_FMT_NV12;
-        else if (a == "--yuyv")     v4l2_format = V4L2_PIX_FMT_YUYV;
+        if      (a == "--device" && i+1 < argc) device   = argv[++i];
+        else if (a == "--width"  && i+1 < argc) width    = static_cast<uint32_t>(std::stoi(argv[++i]));
+        else if (a == "--height" && i+1 < argc) height   = static_cast<uint32_t>(std::stoi(argv[++i]));
+        else if (a == "--socket" && i+1 < argc) sock_path= argv[++i];
+        else if (a == "--yuyv")                 v4l2_fmt = V4L2_PIX_FMT_YUYV;
+        else if (a == "--nv12")                 v4l2_fmt = V4L2_PIX_FMT_NV12;
         else {
             std::fprintf(stderr,
-                "usage: %s [--device /dev/videoN] [--width W] [--height H]"
-                " [--socket PATH] [--yuyv|--nv12]\n", argv[0]);
+                "usage: %s [--device PATH] [--width W] [--height H] "
+                "[--socket PATH] [--yuyv|--nv12]\n", argv[0]);
             return 2;
         }
     }
 
     std::signal(SIGINT,  on_sigint);
     std::signal(SIGTERM, on_sigint);
-    std::signal(SIGPIPE, SIG_IGN); // we already pass MSG_NOSIGNAL but be safe
+    std::signal(SIGPIPE, SIG_IGN);
 
     V4l2Capture cap;
-    if (!cap.open(device, width, height, v4l2_format)) return 1;
+    if (!cap.open(device, width, height, v4l2_fmt)) return 1;
     if (!cap.start(4)) return 1;
 
     uint32_t drm_fourcc = dmabuf::v4l2_to_drm_fourcc(cap.pixel_format());
     if (!drm_fourcc) {
-        std::fprintf(stderr, "no DRM FOURCC mapping for V4L2 format 0x%x\n",
-                     cap.pixel_format());
+        std::fprintf(stderr, "no DRM FOURCC for V4L2 format 0x%x\n", cap.pixel_format());
         return 1;
     }
 
-    ScopedFd listen_fd(dmabuf::create_listening_socket(socket_path));
+    ScopedFd listen_fd(dmabuf::create_listening_socket(sock_path));
     if (!listen_fd) return 1;
+    std::printf("publisher: waiting for subscriber on %s\n", sock_path.c_str());
 
-    std::printf("publisher: waiting for subscriber on %s\n", socket_path.c_str());
     int client_raw = ::accept4(listen_fd.get(), nullptr, nullptr, SOCK_CLOEXEC);
-    if (client_raw < 0) {
-        std::perror("accept");
-        return 1;
-    }
+    if (client_raw < 0) { std::perror("accept"); return 1; }
     ScopedFd client(client_raw);
     std::printf("publisher: subscriber connected\n");
+
+    // Send geometry + all DMA-BUF fds once; per-frame messages carry only idx.
+    const auto& bufs = cap.buffers();
+    std::vector<int> all_fds;
+    all_fds.reserve(bufs.size());
+    for (const auto& b : bufs) all_fds.push_back(b.dmabuf_fd);
+
+    HandshakeMsg hs{};
+    hs.buf_count = static_cast<uint32_t>(all_fds.size());
+    hs.width     = cap.width();
+    hs.height    = cap.height();
+    hs.format    = drm_fourcc;
+    hs.stride    = cap.stride();
+    hs.size      = cap.size_image();
+
+    if (dmabuf::send_handshake(client.get(), hs, all_fds.data(),
+                               static_cast<int>(all_fds.size())) < 0) return 1;
 
     auto last_log = std::chrono::steady_clock::now();
     uint32_t frames_since_log = 0;
@@ -115,33 +110,21 @@ int main(int argc, char** argv) {
         uint32_t idx = 0;
         if (!cap.dequeue(idx)) break;
 
-        FrameMeta meta{};
-        meta.width = cap.width();
-        meta.height = cap.height();
-        meta.format = drm_fourcc;
-        meta.stride = cap.stride();
-        meta.size = cap.size_image();
-        meta.sequence = sequence++;
-
-        int dmabuf_fd = cap.buffers()[idx].dmabuf_fd;
-        if (dmabuf::send_frame(client.get(), meta, dmabuf_fd) < 0) {
-            cap.requeue(idx);
-            break;
+        if (dmabuf::send_frame_idx(client.get(), idx) < 0) {
+            cap.requeue(idx); break;
         }
         if (!wait_for_ack(client.get())) {
-            cap.requeue(idx);
-            break;
+            cap.requeue(idx); break;
         }
         if (!cap.requeue(idx)) break;
 
         ++frames_since_log;
-        auto now = std::chrono::steady_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                           now - last_log).count();
+        ++sequence;
+        auto now     = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_log).count();
         if (elapsed >= 1000) {
             std::printf("publisher: %.1f fps (%u frames)\n",
-                        frames_since_log * 1000.0 / elapsed,
-                        meta.sequence);
+                        frames_since_log * 1000.0 / elapsed, sequence);
             std::fflush(stdout);
             frames_since_log = 0;
             last_log = now;
@@ -149,6 +132,6 @@ int main(int argc, char** argv) {
     }
 
     std::printf("publisher: shutting down\n");
-    ::unlink(socket_path.c_str());
+    ::unlink(sock_path.c_str());
     return 0;
 }

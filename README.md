@@ -2,8 +2,8 @@
 
 A publisher/subscriber pipeline that streams camera frames to a Wayland window
 **without any CPU copy**. The publisher captures frames from a V4L2 device and
-passes each buffer's DMA-BUF file descriptor to the subscriber over a Unix
-domain socket. The subscriber imports the fd directly into EGL and renders it
+passes buffer indices to the subscriber over a Unix domain socket. The
+subscriber imports the pre-shared DMA-BUF fds directly into EGL and renders
 with GLES2.
 
 Two independent implementations are provided: **C++17** and **Rust**.
@@ -11,25 +11,40 @@ Two independent implementations are provided: **C++17** and **Rust**.
 Tested on **Raspberry Pi 5** (VideoCore VII / V3D 7.1.7.0), Debian 13 trixie,
 kernel 6.12.75-rpt-rpi-2712. Achieves a steady 30 fps at 640×480 YUYV.
 
-## How it works
+## Protocol
+
+### Handshake (once at connect)
 
 ```
-Publisher                                   Subscriber
-────────────────────────────────────────────────────────────────────
-V4L2 DQBUF → DMA-BUF fd
-  sendmsg(SCM_RIGHTS) ──────── fd ────────► recvmsg(SCM_RIGHTS)
-                                             eglCreateImageKHR
-                                               (EGL_LINUX_DMA_BUF_EXT)
+Publisher                                    Subscriber
+─────────────────────────────────────────────────────────────────────
+sendmsg(SCM_RIGHTS[buf0..bufN-1])
+  + HandshakeMsg { buf_count, width,    ───► recvmsg → store fds[0..N-1]
+                   height, format,           create window + EGL context
+                   stride, size }
+```
+
+All DMA-BUF file descriptors are transferred once. The subscriber keeps them
+open for the lifetime of the session — no per-frame fd dup or close.
+
+### Per frame
+
+```
+Publisher                                    Subscriber
+─────────────────────────────────────────────────────────────────────
+V4L2 DQBUF → idx
+  send(u32 idx)  ─────────────────────────► recv idx
+                                             eglCreateImageKHR(fds[idx])
                                              glEGLImageTargetTexture2DOES
                                              draw full-screen quad
                                              eglSwapBuffers
-  wait ack → V4L2 QBUF ◄──── 1-byte ack ─── close(fd)
+                                             eglDestroyImageKHR
+  wait ack → V4L2 QBUF ◄──── 1-byte ack ───
 ```
 
-The 1-byte ack handshake keeps publisher and subscriber in lock-step: the
-publisher does not re-queue a V4L2 buffer until the subscriber has finished
-sampling from it, preventing buffer reuse races without shared memory or
-locking.
+The per-frame message is a plain 4-byte `send` — no SCM_RIGHTS, no kernel fd
+table manipulation. `eglDestroyImageKHR` releases EGL's DMA-BUF reference
+before the ack, ensuring the publisher's `QBUF` cannot race the GPU.
 
 `GL_OES_EGL_image_external` handles YUV→RGB conversion on the GPU at sample
 time — no software colour-space conversion is needed.
@@ -41,9 +56,8 @@ time — no software colour-space conversion is needed.
 | `--yuyv` (default) | `V4L2_PIX_FMT_YUYV` | `YUYV` | Single-plane packed |
 | `--nv12` | `V4L2_PIX_FMT_NV12` | `NV12` | Semi-planar Y + interleaved UV |
 
-NV12 requires two EGL plane descriptors (`EGL_DMA_BUF_PLANE0_*` for Y,
-`EGL_DMA_BUF_PLANE1_*` for UV) both pointing at the same fd with different
-offsets.
+NV12 passes two EGL plane descriptors (`EGL_DMA_BUF_PLANE0_*` for Y,
+`EGL_DMA_BUF_PLANE1_*` for UV) pointing at the same fd with different offsets.
 
 ## Repository layout
 
@@ -52,7 +66,7 @@ offsets.
 ├── CMakeLists.txt          C++ build definition
 ├── run.sh                  C++ start/stop script
 ├── include/                C++ shared headers
-│   ├── socket_utils.hpp    FrameMeta, send_frame / recv_frame (SCM_RIGHTS)
+│   ├── socket_utils.hpp    HandshakeMsg, send/recv handshake + idx
 │   ├── v4l2_utils.hpp      V4l2Capture: REQBUFS / EXPBUF / DQBUF/QBUF
 │   ├── wayland_utils.hpp   WaylandWindow: xdg-toplevel + wl_egl_window
 │   └── egl_utils.hpp       EglContext + QuadRenderer (DMA-BUF import + draw)
@@ -213,7 +227,6 @@ selected V4L2 format.
 `WAYLAND_DISPLAY` accordingly.
 
 **fd lifetime**
-The publisher exports each V4L2 buffer fd once at startup and keeps it open
-for the session. `SCM_RIGHTS` duplicates the fd into the subscriber; the
-subscriber closes its copy after EGL takes its own internal reference via
-`eglCreateImageKHR`.
+The publisher exports each V4L2 buffer fd once at startup via `VIDIOC_EXPBUF`
+and keeps it open for the session. The subscriber receives all fds in the
+handshake and holds them open — no per-frame dup or close occurs.

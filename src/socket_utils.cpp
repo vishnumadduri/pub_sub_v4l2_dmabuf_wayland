@@ -46,131 +46,112 @@ static bool fill_sockaddr(sockaddr_un& addr, const std::string& path) {
 
 int create_listening_socket(const std::string& path) {
     int s = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (s < 0) {
-        std::perror("socket");
-        return -1;
-    }
-
-    // Stale socket files from a prior run will make bind() fail with EADDRINUSE.
+    if (s < 0) { std::perror("socket"); return -1; }
     ::unlink(path.c_str());
-
     sockaddr_un addr{};
-    if (!fill_sockaddr(addr, path)) {
-        ::close(s);
-        return -1;
-    }
-
+    if (!fill_sockaddr(addr, path)) { ::close(s); return -1; }
     if (::bind(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-        std::perror("bind");
-        ::close(s);
-        return -1;
+        std::perror("bind"); ::close(s); return -1;
     }
-
     if (::listen(s, 1) < 0) {
-        std::perror("listen");
-        ::close(s);
-        return -1;
+        std::perror("listen"); ::close(s); return -1;
     }
     return s;
 }
 
 int connect_to_socket(const std::string& path) {
     int s = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (s < 0) {
-        std::perror("socket");
-        return -1;
-    }
-
+    if (s < 0) { std::perror("socket"); return -1; }
     sockaddr_un addr{};
-    if (!fill_sockaddr(addr, path)) {
-        ::close(s);
-        return -1;
-    }
-
+    if (!fill_sockaddr(addr, path)) { ::close(s); return -1; }
     if (::connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-        std::perror("connect");
-        ::close(s);
-        return -1;
+        std::perror("connect"); ::close(s); return -1;
     }
     return s;
 }
 
-int send_frame(int sock_fd, const FrameMeta& meta, int dmabuf_fd) {
-    // Pack the FrameMeta as the regular payload and the dmabuf fd as ancillary
-    // data using SCM_RIGHTS. We must send at least one byte for the kernel to
-    // deliver the cmsg, but here we send the whole struct in one go.
+int send_handshake(int sock_fd, const HandshakeMsg& msg,
+                   const int* fds, int nfds) {
     iovec iov{};
-    iov.iov_base = const_cast<FrameMeta*>(&meta);
-    iov.iov_len = sizeof(meta);
+    iov.iov_base = const_cast<HandshakeMsg*>(&msg);
+    iov.iov_len  = sizeof(msg);
 
-    char cbuf[CMSG_SPACE(sizeof(int))];
+    const size_t cbuf_size = CMSG_SPACE(static_cast<size_t>(nfds) * sizeof(int));
+    std::vector<char> cbuf(cbuf_size, 0);
+
+    msghdr hdr{};
+    hdr.msg_iov        = &iov;
+    hdr.msg_iovlen     = 1;
+    hdr.msg_control    = cbuf.data();
+    hdr.msg_controllen = cbuf_size;
+
+    cmsghdr* cmsg    = CMSG_FIRSTHDR(&hdr);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type  = SCM_RIGHTS;
+    cmsg->cmsg_len   = CMSG_LEN(static_cast<size_t>(nfds) * sizeof(int));
+    std::memcpy(CMSG_DATA(cmsg), fds, static_cast<size_t>(nfds) * sizeof(int));
+
+    ssize_t n = ::sendmsg(sock_fd, &hdr, MSG_NOSIGNAL);
+    if (n < 0) { std::perror("sendmsg handshake"); return -1; }
+    if (static_cast<size_t>(n) != sizeof(msg)) {
+        std::fprintf(stderr, "short sendmsg handshake\n"); return -1;
+    }
+    return 0;
+}
+
+int recv_handshake(int sock_fd, HandshakeMsg& msg, std::vector<int>& fds_out) {
+    iovec iov{};
+    iov.iov_base = &msg;
+    iov.iov_len  = sizeof(msg);
+
+    constexpr int kMaxFds = 32;
+    char cbuf[CMSG_SPACE(kMaxFds * sizeof(int))];
     std::memset(cbuf, 0, sizeof(cbuf));
 
-    msghdr msg{};
-    msg.msg_iov = &iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = cbuf;
-    msg.msg_controllen = sizeof(cbuf);
+    msghdr hdr{};
+    hdr.msg_iov        = &iov;
+    hdr.msg_iovlen     = 1;
+    hdr.msg_control    = cbuf;
+    hdr.msg_controllen = sizeof(cbuf);
 
-    cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
-    cmsg->cmsg_level = SOL_SOCKET;
-    cmsg->cmsg_type = SCM_RIGHTS;
-    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
-    std::memcpy(CMSG_DATA(cmsg), &dmabuf_fd, sizeof(int));
-
-    ssize_t n = ::sendmsg(sock_fd, &msg, MSG_NOSIGNAL);
-    if (n < 0) {
-        std::perror("sendmsg");
-        return -1;
+    ssize_t n = ::recvmsg(sock_fd, &hdr, MSG_CMSG_CLOEXEC);
+    if (n == 0) return 1;
+    if (n < 0)  { std::perror("recvmsg handshake"); return -1; }
+    if (static_cast<size_t>(n) != sizeof(msg)) {
+        std::fprintf(stderr, "short recvmsg handshake\n"); return -1;
     }
-    if (static_cast<size_t>(n) != sizeof(meta)) {
-        std::fprintf(stderr, "short sendmsg: %zd of %zu\n", n, sizeof(meta));
+    if (hdr.msg_flags & MSG_CTRUNC) {
+        std::fprintf(stderr, "handshake: ancillary data truncated\n"); return -1;
+    }
+
+    for (cmsghdr* cm = CMSG_FIRSTHDR(&hdr); cm; cm = CMSG_NXTHDR(&hdr, cm)) {
+        if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_RIGHTS) {
+            int count = static_cast<int>((cm->cmsg_len - CMSG_LEN(0)) / sizeof(int));
+            fds_out.resize(count);
+            std::memcpy(fds_out.data(), CMSG_DATA(cm), count * sizeof(int));
+        }
+    }
+
+    if (static_cast<uint32_t>(fds_out.size()) != msg.buf_count) {
+        std::fprintf(stderr, "handshake: expected %u fds, got %zu\n",
+                     msg.buf_count, fds_out.size());
+        for (int fd : fds_out) ::close(fd);
         return -1;
     }
     return 0;
 }
 
-int recv_frame(int sock_fd, FrameMeta& meta, int& dmabuf_fd) {
-    dmabuf_fd = -1;
+int send_frame_idx(int sock_fd, uint32_t idx) {
+    ssize_t n = ::send(sock_fd, &idx, sizeof(idx), MSG_NOSIGNAL);
+    if (n != static_cast<ssize_t>(sizeof(idx))) { std::perror("send idx"); return -1; }
+    return 0;
+}
 
-    iovec iov{};
-    iov.iov_base = &meta;
-    iov.iov_len = sizeof(meta);
-
-    char cbuf[CMSG_SPACE(sizeof(int))];
-    std::memset(cbuf, 0, sizeof(cbuf));
-
-    msghdr msg{};
-    msg.msg_iov = &iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = cbuf;
-    msg.msg_controllen = sizeof(cbuf);
-
-    ssize_t n = ::recvmsg(sock_fd, &msg, MSG_CMSG_CLOEXEC);
-    if (n == 0) return 1; // peer closed cleanly
-    if (n < 0) {
-        std::perror("recvmsg");
-        return -1;
-    }
-    if (static_cast<size_t>(n) != sizeof(meta)) {
-        std::fprintf(stderr, "short recvmsg: %zd of %zu\n", n, sizeof(meta));
-        return -1;
-    }
-    if (msg.msg_flags & MSG_CTRUNC) {
-        std::fprintf(stderr, "ancillary data was truncated\n");
-        return -1;
-    }
-
-    for (cmsghdr* cmsg = CMSG_FIRSTHDR(&msg); cmsg; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
-        if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
-            std::memcpy(&dmabuf_fd, CMSG_DATA(cmsg), sizeof(int));
-            break;
-        }
-    }
-    if (dmabuf_fd < 0) {
-        std::fprintf(stderr, "recvmsg: missing SCM_RIGHTS\n");
-        return -1;
-    }
+int recv_frame_idx(int sock_fd, uint32_t& idx) {
+    ssize_t n = ::recv(sock_fd, &idx, sizeof(idx), MSG_WAITALL);
+    if (n == 0) return 1;
+    if (n < 0)  { std::perror("recv idx"); return -1; }
+    if (static_cast<size_t>(n) != sizeof(idx)) return -1;
     return 0;
 }
 

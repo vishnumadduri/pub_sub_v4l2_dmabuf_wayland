@@ -1,20 +1,25 @@
-// Publisher: captures frames from /dev/video0 via V4L2 (MMAP), exports each
-// buffer as a DMA-BUF, and forwards the file descriptor to a single
+// Publisher: captures frames from a V4L2 device and streams them to a
 // subscriber over a Unix domain socket.
 //
-// Flow per frame:
-//   dequeue → sendmsg(SCM_RIGHTS, fd) → wait for 1-byte ack → requeue
+// Handshake (once):
+//   sendmsg(SCM_RIGHTS, all N dmabuf fds) + Handshake struct
 //
-// The ack handshake keeps producer/consumer in sync: we only re-queue
-// a buffer once the subscriber signals it is done sampling from it.
+// Per frame:
+//   DQBUF → send(u32 idx) → wait 1-byte ack → QBUF
 
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use common::socket::{accept_connection, create_listening_socket, send_frame, wait_for_ack};
+use common::socket::{accept_connection, create_listening_socket, send_handshake, send_idx, wait_for_ack};
 use common::v4l2::{v4l2_to_drm_fourcc, V4l2Capture, V4L2_PIX_FMT_YUYV, V4L2_PIX_FMT_NV12};
-use common::{FrameMeta, DEFAULT_SOCKET_PATH};
+use common::{Handshake, DEFAULT_SOCKET_PATH};
+
+static RUNNING: AtomicBool = AtomicBool::new(true);
+
+extern "C" fn sighandler(_: libc::c_int) {
+    RUNNING.store(false, Ordering::SeqCst);
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut device       = "/dev/video0".to_string();
@@ -40,15 +45,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    {
-        unsafe {
-            libc::signal(libc::SIGINT,  sighandler as libc::sighandler_t);
-            libc::signal(libc::SIGTERM, sighandler as libc::sighandler_t);
-            libc::signal(libc::SIGPIPE, libc::SIG_IGN);
-        }
-        // Store reference for the handler (global).
-        RUNNING.store(true, Ordering::SeqCst);
+    unsafe {
+        libc::signal(libc::SIGINT,  sighandler as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, sighandler as libc::sighandler_t);
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
+    RUNNING.store(true, Ordering::SeqCst);
 
     let mut cap = V4l2Capture::open(&device, width, height, pixel_fmt)?;
     cap.start(4)?;
@@ -63,6 +65,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client_raw = client.as_raw_fd();
     println!("publisher: subscriber connected");
 
+    // Send all DMA-BUF fds once; the subscriber identifies buffers by index.
+    let all_fds: Vec<i32> = cap.buffers.iter().map(|b| b.dmabuf_fd.as_raw_fd()).collect();
+    let hs = Handshake {
+        buf_count: all_fds.len() as u32,
+        width:     cap.width,
+        height:    cap.height,
+        format:    drm_fourcc,
+        stride:    cap.stride,
+        size:      cap.size_image,
+    };
+    send_handshake(client_raw, &hs, &all_fds)?;
+
     let mut last_log = Instant::now();
     let mut frames_since_log: u32 = 0;
     let mut sequence: u32 = 0;
@@ -73,20 +87,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(e) => { eprintln!("dequeue: {e}"); break; }
         };
 
-        let meta = FrameMeta {
-            width:    cap.width,
-            height:   cap.height,
-            format:   drm_fourcc,
-            stride:   cap.stride,
-            size:     cap.size_image,
-            sequence,
-        };
-        sequence += 1;
-
-        let dmabuf_raw = cap.buffers[idx as usize].dmabuf_fd.as_raw_fd();
-
-        if let Err(e) = send_frame(client_raw, &meta, dmabuf_raw) {
-            eprintln!("send_frame: {e}");
+        if let Err(e) = send_idx(client_raw, idx) {
+            eprintln!("send_idx: {e}");
             let _ = cap.requeue(idx);
             break;
         }
@@ -101,10 +103,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         frames_since_log += 1;
+        sequence += 1;
         let elapsed = last_log.elapsed();
         if elapsed.as_millis() >= 1000 {
             let fps = frames_since_log as f64 * 1000.0 / elapsed.as_millis() as f64;
-            println!("publisher: {fps:.1} fps ({} frames)", meta.sequence);
+            println!("publisher: {fps:.1} fps ({sequence} frames)");
             frames_since_log = 0;
             last_log = Instant::now();
         }
@@ -113,10 +116,4 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("publisher: shutting down");
     let _ = std::fs::remove_file(&socket_path);
     Ok(())
-}
-
-static RUNNING: AtomicBool = AtomicBool::new(true);
-
-extern "C" fn sighandler(_: libc::c_int) {
-    RUNNING.store(false, Ordering::SeqCst);
 }
