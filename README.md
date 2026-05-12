@@ -1,98 +1,219 @@
-# dma_buf_pipeline
+# Zero-Copy V4L2 DMA-BUF Wayland Pipeline
 
-Zero-copy DMA-BUF pipeline between two processes:
+A publisher/subscriber pipeline that streams camera frames to a Wayland window
+**without any CPU copy**. The publisher captures frames from a V4L2 device and
+passes each buffer's DMA-BUF file descriptor to the subscriber over a Unix
+domain socket. The subscriber imports the fd directly into EGL and renders it
+with GLES2.
 
-- **publisher**: captures frames from a V4L2 device, exports each MMAP buffer
-  as a DMA-BUF (`VIDIOC_EXPBUF`), and forwards the file descriptor to the
-  subscriber over a Unix domain socket using `SCM_RIGHTS`.
-- **subscriber**: imports the received fd as `EGLImageKHR` via
-  `EGL_LINUX_DMA_BUF_EXT`, binds it to a GL texture with
-  `glEGLImageTargetTexture2DOES`, and renders a fullscreen quad on a
-  Wayland xdg-toplevel surface.
+Two independent implementations are provided: **C++17** and **Rust**.
 
-A 1-byte ack on the same socket gates buffer re-queueing on the producer
-side, so a buffer is never re-queued while the GPU is still sampling it.
+Tested on **Raspberry Pi 5** (VideoCore VII / V3D 7.1.7.0), Debian 13 trixie,
+kernel 6.12.75-rpt-rpi-2712. Achieves a steady 30 fps at 640×480 YUYV.
 
-## Layout
+## How it works
 
 ```
-include/
-  socket_utils.hpp   FrameMeta struct, send_frame / recv_frame (SCM_RIGHTS)
-  v4l2_utils.hpp     V4l2Capture: open + REQBUFS + EXPBUF + DQBUF/QBUF loop
-  wayland_utils.hpp  WaylandWindow: display + xdg-toplevel + wl_egl_window
-  egl_utils.hpp      EglContext + QuadRenderer (DMA-BUF import + draw)
-src/
-  publisher.cpp      capture -> sendmsg(SCM_RIGHTS) -> wait ack -> requeue
-  subscriber.cpp     recvmsg -> EGLImage -> draw -> swap -> ack
+Publisher                                   Subscriber
+────────────────────────────────────────────────────────────────────
+V4L2 DQBUF → DMA-BUF fd
+  sendmsg(SCM_RIGHTS) ──────── fd ────────► recvmsg(SCM_RIGHTS)
+                                             eglCreateImageKHR
+                                               (EGL_LINUX_DMA_BUF_EXT)
+                                             glEGLImageTargetTexture2DOES
+                                             draw full-screen quad
+                                             eglSwapBuffers
+  wait ack → V4L2 QBUF ◄──── 1-byte ack ─── close(fd)
 ```
 
-## Dependencies (Ubuntu/Debian)
+The 1-byte ack handshake keeps publisher and subscriber in lock-step: the
+publisher does not re-queue a V4L2 buffer until the subscriber has finished
+sampling from it, preventing buffer reuse races without shared memory or
+locking.
+
+`GL_OES_EGL_image_external` handles YUV→RGB conversion on the GPU at sample
+time — no software colour-space conversion is needed.
+
+## Supported formats
+
+| Flag | V4L2 format | DRM FOURCC | Notes |
+|------|-------------|------------|-------|
+| `--yuyv` (default) | `V4L2_PIX_FMT_YUYV` | `YUYV` | Single-plane packed |
+| `--nv12` | `V4L2_PIX_FMT_NV12` | `NV12` | Semi-planar Y + interleaved UV |
+
+NV12 requires two EGL plane descriptors (`EGL_DMA_BUF_PLANE0_*` for Y,
+`EGL_DMA_BUF_PLANE1_*` for UV) both pointing at the same fd with different
+offsets.
+
+## Repository layout
 
 ```
-sudo apt install build-essential cmake pkg-config \
-    libwayland-dev wayland-protocols libwayland-egl1 \
-    libegl1-mesa-dev libgles2-mesa-dev \
-    libv4l-dev libdrm-dev
+.
+├── CMakeLists.txt          C++ build definition
+├── run.sh                  C++ start/stop script
+├── include/                C++ shared headers
+│   ├── socket_utils.hpp    FrameMeta, send_frame / recv_frame (SCM_RIGHTS)
+│   ├── v4l2_utils.hpp      V4l2Capture: REQBUFS / EXPBUF / DQBUF/QBUF
+│   ├── wayland_utils.hpp   WaylandWindow: xdg-toplevel + wl_egl_window
+│   └── egl_utils.hpp       EglContext + QuadRenderer (DMA-BUF import + draw)
+├── src/                    C++ source
+│   ├── publisher.cpp
+│   └── subscriber.cpp
+└── rust/
+    ├── Cargo.toml          Workspace (common, publisher, subscriber)
+    ├── run.sh              Rust start/stop script
+    ├── common/             Shared types, V4L2 helpers, socket helpers
+    ├── publisher/          V4L2 capture + DMA-BUF sender
+    └── subscriber/
+        ├── build.rs        C probe — extracts EGL/GL constants from headers
+        └── src/
+            ├── egl.rs      EGL context, DMA-BUF import, GLES2 quad renderer
+            └── wayland.rs  Wayland window (xdg-toplevel + EGL surface)
 ```
 
-CMake `find_package(PkgConfig)` then locates: `wayland-client`,
-`wayland-egl`, `wayland-protocols`, `wayland-scanner`, `egl`, `glesv2`,
-`libv4l2`, `libdrm`. The xdg-shell client glue is generated from
-`stable/xdg-shell/xdg-shell.xml` at configure time.
+## Dependencies
 
-## Build
+### System packages (Debian/Ubuntu)
 
+```bash
+sudo apt install \
+    cmake pkg-config build-essential \
+    libv4l-dev libdrm-dev \
+    libegl-dev libgles-dev \
+    libwayland-dev wayland-protocols
 ```
-mkdir build && cd build
-cmake ..
-make -j
+
+For Rust, install [rustup](https://rustup.rs) or the distro `rustc`/`cargo`
+packages (edition 2021 / Rust 1.65+).
+
+### Runtime requirements
+
+- A running Wayland compositor (`WAYLAND_DISPLAY` / `XDG_RUNTIME_DIR` set).
+- EGL implementation advertising `EGL_EXT_image_dma_buf_import` (Mesa V3D,
+  Intel i965/iris, AMD radeonsi, recent Nvidia).
+- A V4L2 capture device exporting MMAP buffers as DMA-BUF (`VIDIOC_EXPBUF`).
+  Most modern UVC drivers support this.
+
+## Building
+
+### C++
+
+```bash
+cmake -B build
+cmake --build build -j$(nproc)
+# Produces: build/publisher  build/subscriber
 ```
 
-## Run
+The CMake build generates the xdg-shell Wayland protocol glue from
+`stable/xdg-shell/xdg-shell.xml` at configure time via `wayland-scanner`.
 
-The subscriber needs a Wayland session (`WAYLAND_DISPLAY` set). On a vanilla
-GNOME/KDE/Sway desktop that's already true.
+### Rust
 
+```bash
+cd rust
+cargo build --release
+# Produces: rust/target/release/publisher  rust/target/release/subscriber
 ```
+
+`subscriber/build.rs` compiles a small C probe against the system EGL/GLES2
+headers to read every `EGL_*` and `GL_*` token value at build time, writing
+them to `$OUT_DIR/egl_consts.rs`. This avoids hardcoded magic numbers and
+catches token value mismatches early (e.g. plane1 vs plane2 attribute offsets).
+
+## Running
+
+### C++ — `run.sh`
+
+```bash
+bash run.sh
+```
+
+Starts the publisher in the background, waits 300 ms for it to bind the socket,
+then runs the subscriber in the foreground. Press **Ctrl+C** to stop both and
+clean up the socket file.
+
+### Rust — `rust/run.sh`
+
+```bash
+bash rust/run.sh             # auto-builds release binaries if missing
+bash rust/run.sh --build     # force rebuild first
+```
+
+Same start/stop behaviour as the C++ script.
+
+### Running manually
+
+```bash
 # terminal 1
-./publisher --device /dev/video0 --width 640 --height 480 --yuyv
+./build/publisher --device /dev/video0 --width 640 --height 480 --yuyv
 
 # terminal 2
-./subscriber
+./build/subscriber --socket /tmp/dma_buf_socket
 ```
 
-Both accept `--socket /path` to override the default `/tmp/dma_buf_socket`.
+### CLI reference
 
-## Notes & limits
+**publisher**
 
-- **Format coverage.** Start with `--yuyv` (single plane, every UVC webcam
-  supports it). The `--nv12` flag selects NV12 capture, but the subscriber
-  only sets up a single-plane `EGLImage` import — to fully render NV12
-  you'd need to send the second plane's offset/pitch in `FrameMeta`,
-  pass `EGL_DMA_BUF_PLANE1_*` attributes during import, and add a sampler
-  for the chroma plane. The translation table in
-  [v4l2_utils.cpp](src/v4l2_utils.cpp#L185) already maps NV12 -> DRM.
-- **YUYV shader.** When the driver imports YUYV as a single-plane RGBA
-  texture (no native YUV sampling support), each texel covers two source
-  pixels. The fragment shader picks the correct luma sample and converts
-  with BT.601. On drivers that expose native YUYV sampling the shader
-  output may look slightly different — adjust the channel order in
-  [egl_utils.cpp](src/egl_utils.cpp#L173) if so.
-- **fd lifetime.** The publisher exports each V4L2 buffer once at start
-  and keeps the fd alive for the whole session. `SCM_RIGHTS` duplicates
-  the fd into the subscriber, which closes its copy after EGL takes its
-  own reference.
-- **Flow control.** The 1-byte ack from subscriber back to publisher
-  prevents the producer from re-queueing a buffer while it's still being
-  sampled. Without it you'd race the GPU against `VIDIOC_QBUF`.
+```
+publisher [--device PATH] [--width W] [--height H] [--socket PATH] [--yuyv|--nv12]
+```
+
+**subscriber**
+
+```
+subscriber [--socket PATH]
+```
+
+### Environment overrides (scripts)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DEVICE` | `/dev/video0` | V4L2 capture device |
+| `WIDTH` | `640` | Capture width |
+| `HEIGHT` | `480` | Capture height |
+| `FORMAT` | `--yuyv` | Format flag passed to publisher |
+| `SOCKET` | `/tmp/dma_buf_socket` | Unix domain socket path |
+| `WAYLAND_DISPLAY` | `wayland-0` | Wayland compositor socket |
+| `XDG_RUNTIME_DIR` | `/run/user/<uid>` | Runtime directory |
+
+Example — 1280×720 NV12 from a second camera:
+
+```bash
+DEVICE=/dev/video2 WIDTH=1280 HEIGHT=720 FORMAT=--nv12 bash rust/run.sh
+```
+
+## EGL extensions used
+
+| Extension | Purpose |
+|-----------|---------|
+| `EGL_EXT_image_dma_buf_import` | Import DMA-BUF fd as `EGLImageKHR` |
+| `EGL_EXT_image_dma_buf_import_modifiers` | Pass DRM modifiers (optional; probed at runtime) |
+| `EGL_EXT_platform_wayland` / `EGL_KHR_platform_wayland` | Wayland-native EGL display selection |
+| `GL_OES_EGL_image_external` | Bind `EGLImageKHR` as `samplerExternalOES` for GPU-side YUV→RGB |
 
 ## Troubleshooting
 
-- `EGL_EXT_image_dma_buf_import not advertised` — your GPU/driver doesn't
-  support DMA-BUF import. Try Mesa on Intel/AMD or recent Nvidia.
-- `VIDIOC_EXPBUF: Invalid argument` — the capture driver doesn't support
-  exporting MMAP buffers as DMA-BUF. Most modern UVC drivers do; some
-  embedded ISP drivers do not.
-- `eglCreateImageKHR failed: 0x300c` (EGL_BAD_PARAMETER) — width/stride
-  or DRM FOURCC don't match what the driver expects. Check that
-  `meta.stride` is the V4L2 `bytesperline` for the selected format.
+**`EGL_EXT_image_dma_buf_import not advertised`**
+The GPU driver doesn't support DMA-BUF import over EGL. Check that Mesa is
+installed and the correct DRI driver is active (`glxinfo | grep renderer`).
+
+**`VIDIOC_EXPBUF: Invalid argument`**
+The V4L2 driver doesn't support exporting MMAP buffers as DMA-BUF. Most UVC
+webcam drivers do; some embedded ISP drivers do not.
+
+**`eglCreateImageKHR failed: 0x300c` (EGL_BAD_PARAMETER)**
+Width, stride, or DRM FOURCC mismatch. Verify `meta.stride` equals
+`bytesperline` from `VIDIOC_S_FMT`, and that the DRM FOURCC matches the
+selected V4L2 format.
+
+**`NoCompositor` error from subscriber**
+`WAYLAND_DISPLAY` is not set or points to a non-existent socket. Run
+`ls $XDG_RUNTIME_DIR/wayland-*` to find the correct socket name and set
+`WAYLAND_DISPLAY` accordingly.
+
+**fd lifetime**
+The publisher exports each V4L2 buffer fd once at startup and keeps it open
+for the session. `SCM_RIGHTS` duplicates the fd into the subscriber; the
+subscriber closes its copy after EGL takes its own internal reference via
+`eglCreateImageKHR`.

@@ -1,0 +1,18 @@
+[package]
+name = "subscriber"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "subscriber"
+path = "src/main.rs"
+
+[dependencies]
+common = { path = "../common" }
+libc = "0.2"
+wayland-client = "0.31"
+wayland-protocols = { version = "0.31", features = ["client"] }
+wayland-egl = "0.32"
+
+[build-dependencies]
+pkg-config = "0.3"

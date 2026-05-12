@@ -1,0 +1,12 @@
+[package]
+name = "publisher"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "publisher"
+path = "src/main.rs"
+
+[dependencies]
+common = { path = "../common" }
+libc = "0.2"
