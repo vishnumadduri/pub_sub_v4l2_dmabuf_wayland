@@ -1,31 +1,10 @@
 use std::io;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
-use libc::{c_int, c_uint, c_ulong, ioctl, open, close, select, O_RDWR, O_NONBLOCK, O_CLOEXEC};
+use libc::{c_int, c_uint, ioctl, open, close, select, O_RDWR, O_NONBLOCK, O_CLOEXEC};
 
-// ---- FOURCC helpers ---------------------------------------------------------
-
-const fn fourcc(a: u8, b: u8, c: u8, d: u8) -> u32 {
-    a as u32 | ((b as u32) << 8) | ((c as u32) << 16) | ((d as u32) << 24)
-}
-
-pub const V4L2_PIX_FMT_YUYV:  u32 = fourcc(b'Y', b'U', b'Y', b'V');
-pub const V4L2_PIX_FMT_UYVY:  u32 = fourcc(b'U', b'Y', b'V', b'Y');
-pub const V4L2_PIX_FMT_NV12:  u32 = fourcc(b'N', b'V', b'1', b'2');
-pub const V4L2_PIX_FMT_NV21:  u32 = fourcc(b'N', b'V', b'2', b'1');
-pub const V4L2_PIX_FMT_RGB24: u32 = fourcc(b'R', b'G', b'B', b'3');
-pub const V4L2_PIX_FMT_BGR24: u32 = fourcc(b'B', b'G', b'R', b'3');
-pub const V4L2_PIX_FMT_ABGR32: u32 = fourcc(b'A', b'R', b'2', b'4');
-pub const V4L2_PIX_FMT_XBGR32: u32 = fourcc(b'X', b'R', b'2', b'4');
-
-// DRM FOURCC constants (from drm_fourcc.h)
-pub const DRM_FORMAT_YUYV:    u32 = fourcc(b'Y', b'U', b'Y', b'V');
-pub const DRM_FORMAT_UYVY:    u32 = fourcc(b'U', b'Y', b'V', b'Y');
-pub const DRM_FORMAT_NV12:    u32 = fourcc(b'N', b'V', b'1', b'2');
-pub const DRM_FORMAT_NV21:    u32 = fourcc(b'N', b'V', b'2', b'1');
-pub const DRM_FORMAT_RGB888:  u32 = fourcc(b'R', b'G', b'2', b'4'); // "RG24"
-pub const DRM_FORMAT_BGR888:  u32 = fourcc(b'B', b'G', b'2', b'4'); // "BG24"
-pub const DRM_FORMAT_ARGB8888: u32 = fourcc(b'A', b'R', b'2', b'4'); // "AR24"
-pub const DRM_FORMAT_XRGB8888: u32 = fourcc(b'X', b'R', b'2', b'4'); // "XR24"
+// V4L2/DRM constants extracted from system headers at build time.
+// On 64-bit Linux c_ulong == u64, so VIDIOC_* ioctl numbers are emitted as u64.
+include!(concat!(env!("OUT_DIR"), "/v4l2_consts.rs"));
 
 pub fn v4l2_to_drm_fourcc(v4l2: u32) -> Option<u32> {
     match v4l2 {
@@ -40,25 +19,6 @@ pub fn v4l2_to_drm_fourcc(v4l2: u32) -> Option<u32> {
         _ => None,
     }
 }
-
-// ---- V4L2 constants --------------------------------------------------------
-
-const V4L2_BUF_TYPE_VIDEO_CAPTURE: u32 = 1;
-const V4L2_MEMORY_MMAP: u32 = 1;
-const V4L2_FIELD_ANY: u32 = 0;
-const V4L2_CAP_VIDEO_CAPTURE: u32 = 0x0000_0001;
-const V4L2_CAP_STREAMING:     u32 = 0x0400_0000;
-
-// Ioctl numbers verified against <linux/videodev2.h> on aarch64 / x86-64.
-const VIDIOC_QUERYCAP:  c_ulong = 0x8068_5600;
-const VIDIOC_S_FMT:     c_ulong = 0xc0d0_5605;
-const VIDIOC_REQBUFS:   c_ulong = 0xc014_5608;
-const VIDIOC_QUERYBUF:  c_ulong = 0xc058_5609;
-const VIDIOC_EXPBUF:    c_ulong = 0xc040_5610;
-const VIDIOC_QBUF:      c_ulong = 0xc058_560f;
-const VIDIOC_DQBUF:     c_ulong = 0xc058_5611;
-const VIDIOC_STREAMON:  c_ulong = 0x4004_5612;
-const VIDIOC_STREAMOFF: c_ulong = 0x4004_5613;
 
 // ---- Kernel struct mirrors (verified offsets/sizes) ------------------------
 // All layouts confirmed with offsetof/sizeof on aarch64 (Raspberry Pi 5).
@@ -146,7 +106,7 @@ struct V4l2ExportBuffer {
 
 // ---- ioctl wrapper ---------------------------------------------------------
 
-unsafe fn xioctl<T>(fd: RawFd, req: c_ulong, arg: *mut T) -> c_int {
+unsafe fn xioctl<T>(fd: RawFd, req: u64, arg: *mut T) -> c_int {
     loop {
         let r = ioctl(fd, req, arg);
         if r == -1 && *libc::__errno_location() == libc::EINTR {
