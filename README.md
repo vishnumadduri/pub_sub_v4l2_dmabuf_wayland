@@ -59,6 +59,21 @@ time — no software colour-space conversion is needed.
 NV12 passes two EGL plane descriptors (`EGL_DMA_BUF_PLANE0_*` for Y,
 `EGL_DMA_BUF_PLANE1_*` for UV) pointing at the same fd with different offsets.
 
+## Cross-compatibility
+
+The wire protocol is binary-compatible between implementations — the
+`HandshakeMsg` struct layout and integer encoding are identical in both
+languages, so publishers and subscribers can be mixed freely.
+
+| Publisher | Subscriber | Result |
+|-----------|-----------|--------|
+| C++  | C++  | 30 fps |
+| Rust | Rust | 30 fps |
+| C++  | Rust | 30 fps |
+| Rust | C++  | 30 fps |
+
+Tested on Raspberry Pi 5, 640×480 YUYV, V3D 7.1.7.0.
+
 ## Repository layout
 
 ```
@@ -77,6 +92,7 @@ NV12 passes two EGL plane descriptors (`EGL_DMA_BUF_PLANE0_*` for Y,
     ├── Cargo.toml          Workspace (common, publisher, subscriber)
     ├── run.sh              Rust start/stop script
     ├── common/             Shared types, V4L2 helpers, socket helpers
+    │   └── build.rs        C probe — extracts V4L2/DRM constants from headers
     ├── publisher/          V4L2 capture + DMA-BUF sender
     └── subscriber/
         ├── build.rs        C probe — extracts EGL/GL constants from headers
