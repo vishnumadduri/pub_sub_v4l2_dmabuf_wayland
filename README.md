@@ -116,6 +116,25 @@ sudo apt install \
 For Rust, install [rustup](https://rustup.rs) or the distro `rustc`/`cargo`
 packages (edition 2021 / Rust 1.65+).
 
+### Yocto / BusyBox code-server installer
+
+This repository includes a POSIX `sh` installer adapted for Yocto systems that
+use `opkg` and BusyBox shell:
+
+```bash
+./install-code-server-yocto.sh
+```
+
+Useful flags:
+
+```bash
+./install-code-server-yocto.sh --method detect
+./install-code-server-yocto.sh --method opkg
+./install-code-server-yocto.sh --method standalone --prefix /usr/local
+./install-code-server-yocto.sh --version 4.103.2
+./install-code-server-yocto.sh --dry-run
+```
+
 ### Runtime requirements
 
 - A running Wayland compositor (`WAYLAND_DISPLAY` / `XDG_RUNTIME_DIR` set).
