@@ -101,7 +101,7 @@ arch() {
 }
 
 extract_tag_name() {
-  sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1 | sed 's/^v//'
+  sed -n 's/.*"tag_name":[ ]*"\([^"]*\)".*/\1/p' | head -n 1 | sed 's/^v//'
 }
 
 echo_latest_version() {
@@ -167,6 +167,9 @@ install_standalone() {
   fi
 
   "$RUN_AS" mkdir -p "$INSTALL_PREFIX/lib" "$INSTALL_PREFIX/bin"
+  if [ -d "$INSTALL_PREFIX/lib/code-server-${VERSION}-${OS}-${ARCH}" ]; then
+    "$RUN_AS" rm -rf "$INSTALL_PREFIX/lib/code-server-${VERSION}-${OS}-${ARCH}"
+  fi
   "$RUN_AS" tar -C "$INSTALL_PREFIX/lib" -xzf "$FILE"
   if [ -d "$INSTALL_PREFIX/lib/code-server-${VERSION}" ]; then
     "$RUN_AS" rm -rf "$INSTALL_PREFIX/lib/code-server-${VERSION}"
