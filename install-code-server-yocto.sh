@@ -101,7 +101,7 @@ arch() {
 }
 
 extract_tag_name() {
-  sed -n 's/.*"tag_name":[ ]*"v*\([^"]*\)".*/\1/p; q'
+  sed -n 's/.*"tag_name": *"v*\([^"]*\)".*/\1/p; q'
 }
 
 echo_latest_version() {
@@ -167,10 +167,10 @@ install_standalone() {
   fi
 
   "$RUN_AS" mkdir -p "$INSTALL_PREFIX/lib" "$INSTALL_PREFIX/bin"
-  "$RUN_AS" tar -C "$INSTALL_PREFIX/lib" -xzf "$FILE"
   if [ -d "$INSTALL_PREFIX/lib/code-server-${VERSION}" ]; then
     "$RUN_AS" rm -rf "$INSTALL_PREFIX/lib/code-server-${VERSION}"
   fi
+  "$RUN_AS" tar -C "$INSTALL_PREFIX/lib" -xzf "$FILE"
   "$RUN_AS" mv "$INSTALL_PREFIX/lib/code-server-${VERSION}-${OS}-${ARCH}" "$INSTALL_PREFIX/lib/code-server-${VERSION}"
   "$RUN_AS" ln -fs "$INSTALL_PREFIX/lib/code-server-${VERSION}/bin/code-server" "$INSTALL_PREFIX/bin/code-server"
 
