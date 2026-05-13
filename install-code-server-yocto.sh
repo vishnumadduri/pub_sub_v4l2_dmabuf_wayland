@@ -101,12 +101,13 @@ arch() {
 }
 
 extract_tag_name() {
-  sed -n 's/.*"tag_name": *"v*\([^"]*\)".*/\1/p; q'
+  RAW_TAG="$(sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p; q')"
+  echo "${RAW_TAG#v}"
 }
 
 echo_latest_version() {
   if [ -n "${EDGE:-}" ]; then
-    TAG="$(http_get "https://api.github.com/repos/coder/code-server/releases" | extract_tag_name)"
+    TAG="$(http_get "https://api.github.com/repos/coder/code-server/releases?per_page=1" | extract_tag_name)"
   else
     TAG="$(http_get "https://api.github.com/repos/coder/code-server/releases/latest" | extract_tag_name)"
   fi
@@ -159,13 +160,16 @@ install_standalone() {
   echoh "Installing v${VERSION} standalone for ${OS}/${ARCH}."
   fetch_file "$URL" "$FILE"
 
-  sh_c mkdir -p "$INSTALL_PREFIX"
-
   RUN_AS="sh_c"
-  if [ ! -w "$INSTALL_PREFIX" ] && [ -z "${DRY_RUN:-}" ]; then
+  WRITE_CHECK_PATH="$INSTALL_PREFIX"
+  if [ ! -e "$WRITE_CHECK_PATH" ]; then
+    WRITE_CHECK_PATH="$(dirname "$WRITE_CHECK_PATH")"
+  fi
+  if [ ! -w "$WRITE_CHECK_PATH" ] && [ -z "${DRY_RUN:-}" ]; then
     RUN_AS="sudo_sh_c"
   fi
 
+  "$RUN_AS" mkdir -p "$INSTALL_PREFIX"
   "$RUN_AS" mkdir -p "$INSTALL_PREFIX/lib" "$INSTALL_PREFIX/bin"
   if [ -d "$INSTALL_PREFIX/lib/code-server-${VERSION}" ]; then
     "$RUN_AS" rm -rf "$INSTALL_PREFIX/lib/code-server-${VERSION}"
