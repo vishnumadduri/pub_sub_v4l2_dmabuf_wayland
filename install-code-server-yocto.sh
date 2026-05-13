@@ -35,7 +35,7 @@ command_exists() {
 sh_c() {
   echoh "+ $*"
   if [ -z "${DRY_RUN:-}" ]; then
-    sh -c "$*"
+    "$@"
   fi
 }
 
@@ -43,14 +43,18 @@ sudo_sh_c() {
   if [ "$(id -u)" = "0" ]; then
     sh_c "$@"
   elif command_exists sudo; then
-    sh_c "sudo $*"
+    echoh "+ sudo $*"
+    if [ -z "${DRY_RUN:-}" ]; then
+      sudo "$@"
+    fi
   elif command_exists doas; then
-    sh_c "doas $*"
-  elif command_exists su; then
-    sh_c "su root -c '$*'"
+    echoh "+ doas $*"
+    if [ -z "${DRY_RUN:-}" ]; then
+      doas "$@"
+    fi
   else
     echoerr "Need root privileges for: $*"
-    echoerr "Please run as root or install sudo/doas/su."
+    echoerr "Please run as root or install sudo/doas."
     exit 1
   fi
 }
@@ -76,14 +80,14 @@ fetch_file() {
   fi
   mkdir -p "$(dirname "$OUT")"
   if command_exists curl; then
-    sh_c "curl -fL -o '$OUT.incomplete' '$URL'"
+    sh_c curl -fL -o "$OUT.incomplete" "$URL"
   elif command_exists wget; then
-    sh_c "wget -O '$OUT.incomplete' '$URL'"
+    sh_c wget -O "$OUT.incomplete" "$URL"
   else
     echoerr "curl or wget is required."
     exit 1
   fi
-  sh_c "mv '$OUT.incomplete' '$OUT'"
+  sh_c mv "$OUT.incomplete" "$OUT"
 }
 
 arch() {
@@ -97,7 +101,7 @@ arch() {
 }
 
 extract_tag_name() {
-  sed -n 's/.*"tag_name": "v\{0,1\}\([^"]*\)".*/\1/p' | head -n 1
+  sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1 | sed 's/^v//'
 }
 
 echo_latest_version() {
@@ -125,8 +129,8 @@ install_opkg() {
   fi
 
   echoh "Installing with opkg (${PKG})."
-  sudo_sh_c "opkg update"
-  if sudo_sh_c "opkg install '$PKG'"; then
+  sudo_sh_c opkg update
+  if sudo_sh_c opkg install "$PKG"; then
     echoh
     echoh "code-server installed via opkg."
     echoh "Run with: code-server"
@@ -155,20 +159,20 @@ install_standalone() {
   echoh "Installing v${VERSION} standalone for ${OS}/${ARCH}."
   fetch_file "$URL" "$FILE"
 
-  sh_c "mkdir -p '$INSTALL_PREFIX'"
+  sh_c mkdir -p "$INSTALL_PREFIX"
 
   RUN_AS="sh_c"
   if [ ! -w "$INSTALL_PREFIX" ] && [ -z "${DRY_RUN:-}" ]; then
     RUN_AS="sudo_sh_c"
   fi
 
-  "$RUN_AS" "mkdir -p '$INSTALL_PREFIX/lib' '$INSTALL_PREFIX/bin'"
-  "$RUN_AS" "tar -C '$INSTALL_PREFIX/lib' -xzf '$FILE'"
-  if [ -d "$INSTALL_PREFIX/lib/code-server-${VERSION}" ] || [ -n "${DRY_RUN:-}" ]; then
-    "$RUN_AS" "rm -rf '$INSTALL_PREFIX/lib/code-server-${VERSION}'"
+  "$RUN_AS" mkdir -p "$INSTALL_PREFIX/lib" "$INSTALL_PREFIX/bin"
+  "$RUN_AS" tar -C "$INSTALL_PREFIX/lib" -xzf "$FILE"
+  if [ -d "$INSTALL_PREFIX/lib/code-server-${VERSION}" ]; then
+    "$RUN_AS" rm -rf "$INSTALL_PREFIX/lib/code-server-${VERSION}"
   fi
-  "$RUN_AS" "mv '$INSTALL_PREFIX/lib/code-server-${VERSION}-${OS}-${ARCH}' '$INSTALL_PREFIX/lib/code-server-${VERSION}'"
-  "$RUN_AS" "ln -fs '$INSTALL_PREFIX/lib/code-server-${VERSION}/bin/code-server' '$INSTALL_PREFIX/bin/code-server'"
+  "$RUN_AS" mv "$INSTALL_PREFIX/lib/code-server-${VERSION}-${OS}-${ARCH}" "$INSTALL_PREFIX/lib/code-server-${VERSION}"
+  "$RUN_AS" ln -fs "$INSTALL_PREFIX/lib/code-server-${VERSION}/bin/code-server" "$INSTALL_PREFIX/bin/code-server"
 
   echoh
   echoh "Standalone install complete."
