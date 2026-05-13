@@ -96,11 +96,15 @@ arch() {
   esac
 }
 
+extract_tag_name() {
+  sed -n 's/.*"tag_name": "v\{0,1\}\([^"]*\)".*/\1/p' | head -n 1
+}
+
 echo_latest_version() {
   if [ -n "${EDGE:-}" ]; then
-    TAG="$(http_get "https://api.github.com/repos/coder/code-server/releases" | sed -n 's/.*"tag_name": "v\{0,1\}\([^"]*\)".*/\1/p' | head -n 1)"
+    TAG="$(http_get "https://api.github.com/repos/coder/code-server/releases" | extract_tag_name)"
   else
-    TAG="$(http_get "https://api.github.com/repos/coder/code-server/releases/latest" | sed -n 's/.*"tag_name": "v\{0,1\}\([^"]*\)".*/\1/p' | head -n 1)"
+    TAG="$(http_get "https://api.github.com/repos/coder/code-server/releases/latest" | extract_tag_name)"
   fi
   if [ -z "$TAG" ]; then
     echoerr "Unable to determine latest version from GitHub API."
@@ -135,7 +139,13 @@ install_opkg() {
 
 install_standalone() {
   INSTALL_PREFIX="${STANDALONE_INSTALL_PREFIX:-/usr/local}"
-  CACHE_DIR="${XDG_CACHE_HOME:-${HOME:-/tmp}/.cache}/code-server"
+  if [ -n "${XDG_CACHE_HOME:-}" ]; then
+    CACHE_DIR="${XDG_CACHE_HOME}/code-server"
+  elif [ -n "${HOME:-}" ]; then
+    CACHE_DIR="${HOME}/.cache/code-server"
+  else
+    CACHE_DIR="/tmp/code-server-cache"
+  fi
   OS=linux
   ARCH="$(arch)"
 
@@ -154,7 +164,9 @@ install_standalone() {
 
   "$RUN_AS" "mkdir -p '$INSTALL_PREFIX/lib' '$INSTALL_PREFIX/bin'"
   "$RUN_AS" "tar -C '$INSTALL_PREFIX/lib' -xzf '$FILE'"
-  "$RUN_AS" "rm -rf '$INSTALL_PREFIX/lib/code-server-${VERSION}'"
+  if [ -d "$INSTALL_PREFIX/lib/code-server-${VERSION}" ] || [ -n "${DRY_RUN:-}" ]; then
+    "$RUN_AS" "rm -rf '$INSTALL_PREFIX/lib/code-server-${VERSION}'"
+  fi
   "$RUN_AS" "mv '$INSTALL_PREFIX/lib/code-server-${VERSION}-${OS}-${ARCH}' '$INSTALL_PREFIX/lib/code-server-${VERSION}'"
   "$RUN_AS" "ln -fs '$INSTALL_PREFIX/lib/code-server-${VERSION}/bin/code-server' '$INSTALL_PREFIX/bin/code-server'"
 
