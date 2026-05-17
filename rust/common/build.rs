@@ -45,6 +45,7 @@ int main(void) {
     /* ----- buffer type / memory / field / capability ----- */
     EU(V4L2_BUF_TYPE_VIDEO_CAPTURE);
     EU(V4L2_MEMORY_MMAP);
+    EU(V4L2_MEMORY_DMABUF);
     EU(V4L2_FIELD_ANY);
     EU(V4L2_CAP_VIDEO_CAPTURE);
     EU(V4L2_CAP_STREAMING);
